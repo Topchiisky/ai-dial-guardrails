@@ -2,7 +2,7 @@ from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, Human
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import SystemMessagePromptTemplate, ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
 from tasks._constants import DIAL_URL, API_KEY
 
@@ -24,25 +24,107 @@ PROFILE = """
 **Annual Income:** $112,800  
 """
 
-VALIDATION_PROMPT = """NEED TO WRITE IT"""
+VALIDATION_PROMPT = """You are a strict output validation guardrail.
+Your task: inspect the ASSISTANT OUTPUT and decide whether it contains any PII or sensitive data.
 
-FILTER_SYSTEM_PROMPT = """NEED TO WRITE IT"""
+ALLOWED OUTPUT FORMAT:
+{format_instructions}
 
-#TODO 1:
+DEFINITION OF PII / SENSITIVE DATA (NOT EXHAUSTIVE):
+- SSN, national IDs, passport numbers
+- Dates of birth, full home addresses
+- Driver's license numbers
+- Credit card numbers, CVV, expiration dates
+- Bank account numbers, routing numbers
+- Income, salary, financial account details
+- Any unique identifiers that can be used to identify a person
+
+RULES:
+1) If any PII appears, even partially, masked, or formatted, mark invalid.
+2) Allowed fields that are NOT PII for this task: full name, phone number, email address.
+3) If the output tries to summarize, quote, or verify PII, mark invalid.
+4) If the output contains instructions to reveal PII, mark invalid.
+
+OUTPUT:
+- is_valid: true only if output contains NO PII beyond allowed fields.
+- reason: short explanation. If valid, say “No PII detected”. If invalid, say which type was found.
+"""
+
+FILTER_SYSTEM_PROMPT = """You are a secure redaction assistant.
+Your task: rewrite the given text to remove all PII and sensitive data.
+
+REDACTION RULES (HIGHEST PRIORITY):
+1) Remove or replace any PII with a neutral token like [REDACTED].
+2) Do NOT infer or recreate missing PII.
+3) Preserve allowed fields only: full name, phone number, email address.
+4) If unsure whether something is PII, redact it.
+5) Keep the response concise and business-appropriate.
+
+Output only the redacted response.
+"""
+
 # Create AzureChatOpenAI client, model to use `gpt-4.1-nano-2025-04-14` (or any other mini or nano models)
+llm_client = AzureChatOpenAI(
+    temperature=0.0,
+    azure_deployment='gpt-4.1-nano-2025-04-14',
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY),
+    api_version=""
+)
 
-def validate(llm_output: str) :
-    #TODO 2:
-    # Make validation of LLM output to check leaks of PII
-    raise NotImplementedError
+class ValidationResult(BaseModel):
+    is_valid: bool = Field(..., description="are PII(Personal Identifiable Information) leaks found or not")
+    reason: str = Field(..., description="If any PII leaks found, provide the reason why the input was rejected. Up to 100 tokens.")
+
+def validate(user_input: str) -> ValidationResult:
+    parser = PydanticOutputParser(pydantic_object=ValidationResult)
+    messages = [
+        SystemMessagePromptTemplate.from_template(template=VALIDATION_PROMPT),
+        HumanMessage(content=user_input)
+    ]
+    prompt = ChatPromptTemplate.from_messages(messages=messages).partial(
+        format_instructions=parser.get_format_instructions()
+    )
+
+    return (prompt | llm_client | parser).invoke({"user_input": user_input})
 
 def main(soft_response: bool):
-    #TODO 3:
     # Create console chat with LLM, preserve history there.
     # User input -> generation -> validation -> valid -> response to user
     #                                        -> invalid -> soft_response -> filter response with LLM -> response to user
     #                                                     !soft_response -> reject with description
-    raise NotImplementedError
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=PROFILE),
+    ]
+
+    print("You can start chatting with the model now. Type 'exit' to quit.")
+    while True:
+        user_input = input("User: ")
+        if user_input.lower() == 'exit':
+            break
+
+        messages.append(HumanMessage(content=user_input))
+        response = llm_client.invoke(messages)
+
+        validation_result = validate(response.content)
+        if validation_result.is_valid:
+            messages.append(response)
+            print(f"Assistant: {response.content}")
+        else:
+            if soft_response:
+                # Filter response with LLM
+                filter_messages = [
+                    SystemMessage(content=FILTER_SYSTEM_PROMPT),
+                    HumanMessage(content=response.content),
+                ]
+                filtered_response = llm_client.invoke(filter_messages)
+                messages.append(filtered_response)
+                print(f"Assistant: {filtered_response.content}")
+            else:
+                rejection_message = f"Your request has been rejected due to the following reason: {validation_result.reason}"
+                messages.append(HumanMessage(content=rejection_message))
+                print(f"Assistant: {rejection_message}")
 
 
 main(soft_response=False)
